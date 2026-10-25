@@ -410,6 +410,37 @@ class TextInjector:
             return False
         return True
 
+    def forward_events(self, events: list[object]) -> bool:
+        """Re-emit raw key events (press, release, repeat) on the virtual keyboard.
+
+        The daemon uses this to replay what the user typed while the keyboards
+        were grabbed for a fix. Non-key events are skipped. Only the ``uinput``
+        backend can do this; other backends return ``False``.
+        """
+        if self._backend != BACKEND_UINPUT:
+            return False
+        try:
+            import evdev
+        except ImportError:
+            return False
+        ev_key = int(evdev.ecodes.EV_KEY)
+        keys = [
+            (int(getattr(event, "code", -1)), int(getattr(event, "value", 0)))
+            for event in events
+            if getattr(event, "type", None) == ev_key
+        ]
+        if not keys:
+            return True
+        try:
+            device = self._acquire_uinput(evdev, {code for code, _value in keys})
+            for code, value in keys:
+                device.write(ev_key, code, value)
+                device.syn()
+        except (OSError, PermissionError, ValueError):
+            self._uinput_failed()
+            return False
+        return True
+
     def _resolve_uinput_keys(
         self, text: str, layout: str
     ) -> tuple[list[tuple[int, bool]], set[int]] | None:

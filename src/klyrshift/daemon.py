@@ -91,6 +91,12 @@ _MIN_INTERVALS_FOR_ADAPT: Final[int] = 5
 NOTIFY_TIMEOUT: Final[float] = 3.0
 # Pause between keyboard re-discovery attempts after the last device vanished.
 DEVICE_RESCAN_DELAY: Final[float] = 2.0
+# While a fix runs the keyboards are grabbed and what the user types is
+# replayed afterwards. The grab waits this long for held keys to be released
+# first (a key pressed before the grab and released during it would otherwise
+# stay down in the compositor), and never lasts longer than the second value.
+GRAB_KEYS_UP_TIMEOUT: Final[float] = 0.3
+GRAB_MAX_SECONDS: Final[float] = 3.0
 # The learning counters are flushed to disk at most this often, so a busy
 # session does not write a file on every keystroke.
 LEARNING_PERSIST_INTERVAL: Final[float] = 60.0
@@ -230,6 +236,26 @@ def _compile_skip_regex(pattern: str) -> re.Pattern[str] | None:
     except re.error:
         logger.warning("Invalid custom_skip_regex; ignoring it")
         return None
+
+
+def _track_key_state(down: set[int], event: object) -> None:
+    """Update the set of held key codes with one input event."""
+    if getattr(event, "type", None) != 1:  # EV_KEY
+        return
+    code = int(getattr(event, "code", -1))
+    value = int(getattr(event, "value", 0))
+    if value == 1:
+        down.add(code)
+    elif value == 0:
+        down.discard(code)
+
+
+def _event_time(event: object) -> float:
+    """Return an input event's timestamp (seconds, CLOCK_REALTIME)."""
+    timestamp = getattr(event, "timestamp", None)
+    if callable(timestamp):
+        return float(timestamp())
+    return float(getattr(event, "sec", 0)) + float(getattr(event, "usec", 0)) / 1e6
 
 
 def _load_ecodes() -> tuple[dict[int, tuple[str, str]], dict[str, int]]:
@@ -409,6 +435,16 @@ class KlyrshiftDaemon:
         self._key_intervals: deque[float] = deque(maxlen=_TYPING_INTERVAL_WINDOW)
         self._prev_key_time: float = 0.0
         self._shift = False
+        # Events read from the keyboards but not handled yet. The loop handles
+        # them one by one from here, so a fix can see the keys typed after the
+        # word (still queued, or still in the kernel).
+        self._event_queue: deque[object] = deque()
+        self._selector: selectors.BaseSelector | None = None
+        # Key codes currently held, from the events handled so far. Tracked
+        # here rather than asked of the kernel: EVIOCGKEY (``active_keys``)
+        # flushes this client's queued key events, losing the very keys a fix
+        # must replay.
+        self._keys_down: set[int] = set()
         # Set while a Ctrl/Alt chord is held: the word typed before the chord is
         # suspended (dropped if the chord turns out not to be a hotkey) so that
         # ``Ctrl+C`` does not leave a stale word behind, while a Ctrl-based fix
@@ -616,6 +652,7 @@ class KlyrshiftDaemon:
                 else:
                     logger.warning("Deferred key queue full; dropping an event")
                 return
+        _track_key_state(self._keys_down, event)
         try:
             self._handle_event_inner(event)
         except Exception as exc:  # the daemon must survive any per-event failure
@@ -2064,7 +2101,7 @@ class KlyrshiftDaemon:
             target,
             boundary_char if backspace_total != backspace_count else "",
         )
-        if self._switch_and_replace(backspace_total, replacement, target):
+        if self._switch_and_replace(backspace_total, replacement, target, keep_late_keys=boundary):
             self.learning.observe_corrected(buffer)
             # Remember the pre-fix text so a bare Ctrl+Z can suppress exactly the
             # word the user restored (only set on a real fix, so an unrelated
@@ -2210,6 +2247,7 @@ class KlyrshiftDaemon:
 
         self._running = True
         selector = selectors.DefaultSelector()
+        self._selector = selector
         for device in devices:
             try:
                 selector.register(device.fd, selectors.EVENT_READ, device)
@@ -2276,7 +2314,9 @@ class KlyrshiftDaemon:
         logger.info("Klyrshift stopped")
         return 0
 
-    def _switch_and_replace(self, backspace_count: int, text: str, target: str) -> bool:
+    def _switch_and_replace(
+        self, backspace_count: int, text: str, target: str, *, keep_late_keys: bool = False
+    ) -> bool:
         """Switch to ``target`` and replace the last ``backspace_count`` chars.
 
         The deletion does not depend on the layout, so with the real switcher
@@ -2286,13 +2326,229 @@ class KlyrshiftDaemon:
         Backspaces are processed instead of before them. Other backends switch
         synchronously inside ``start_switch``, which keeps their order and
         timing unchanged. Test doubles take the plain sequential path.
+
+        ``keep_late_keys`` (the automatic fix after a word boundary) protects
+        the keys the user goes on typing: see :meth:`_fix_with_keyboards_grabbed`.
         """
-        if isinstance(self.switcher, LayoutSwitcher) and isinstance(self.injector, TextInjector):
+        if not (
+            isinstance(self.switcher, LayoutSwitcher) and isinstance(self.injector, TextInjector)
+        ):
+            self.switcher.switch_to(target)
+            time.sleep(0.05)
+            return self.injector.replace_text(backspace_count, text, target)
+        if keep_late_keys and self.injector.backend == "uinput":
+            keyboards = self._physical_keyboards()
+            if keyboards and all(
+                callable(getattr(device, name, None))
+                for device in keyboards
+                for name in ("grab", "ungrab", "read_one")
+            ):
+                return self._fix_with_keyboards_grabbed(keyboards, backspace_count, text, target)
+        finish = self.switcher.start_switch(target)
+        return self.injector.replace_text(backspace_count, text, target, before_typing=finish)
+
+    def _fix_with_keyboards_grabbed(
+        self, keyboards: list[Any], backspace_count: int, text: str, target: str
+    ) -> bool:
+        """Apply a fix while the keyboards are grabbed, then replay what was typed.
+
+        A fix takes a few hundred milliseconds and the user keeps typing. Those
+        keys used to reach the application in the middle of the deletion, so
+        the count-based rewrite deleted them plus part of the word and the
+        correction landed in the wrong place (``ghbdtn vbh`` -> ``ghbпривет``).
+
+        Now the keyboards are grabbed (``EVIOCGRAB``) for the duration of the
+        fix: what the user types reaches only the daemon, which replays it on
+        its virtual keyboard once the fix is done -- in the new layout, like the
+        rest of the typing after a switch -- and then handles it as the start of
+        the next word. The grab waits for held keys to be released, and is
+        released only once all keys are up again, so the compositor always sees
+        a press and its release from the same device.
+
+        Letters typed between the word boundary and the grab already reached
+        the application; they are deleted with the word and retyped after the
+        replacement. If anything else was typed in that window the caret may
+        have moved, so the fix is skipped.
+        """
+        seen: list[object] = []
+        if not self._wait_for_keys_up(seen, GRAB_KEYS_UP_TIMEOUT):
+            # A key is still held: grabbing now would hide its release from
+            # the compositor and leave it stuck. Fix without the grab.
+            logger.debug("A key is still held; fixing without the grab")
+            self._event_queue.extendleft(reversed(seen))
             finish = self.switcher.start_switch(target)
             return self.injector.replace_text(backspace_count, text, target, before_typing=finish)
-        self.switcher.switch_to(target)
-        time.sleep(0.05)
-        return self.injector.replace_text(backspace_count, text, target)
+        grabbed: list[Any] = []
+        # Events stamped before this reached the application; later ones are
+        # grabbed. The kernel stamps events with CLOCK_REALTIME, like time.time().
+        grab_started = time.time()
+        try:
+            for device in keyboards:
+                device.grab()
+                grabbed.append(device)
+        except OSError:
+            logger.debug("Could not grab the keyboards; fixing without the grab", exc_info=True)
+            self._ungrab(grabbed)
+            self._event_queue.extendleft(reversed(seen))
+            finish = self.switcher.start_switch(target)
+            return self.injector.replace_text(backspace_count, text, target, before_typing=finish)
+
+        early: list[object] = []
+        replayed: list[object] = []
+        ungrabbed_at = 0.0
+        ok = False
+        try:
+            drained = seen + self._take_late_keys()
+            seen = drained
+            early = [event for event in drained if _event_time(event) < grab_started]
+            first_grabbed = [event for event in drained if _event_time(event) >= grab_started]
+            keys = self._plain_keys(early)
+            if keys is None:
+                logger.info("Keys other than letters were typed during the fix; skipping it")
+            else:
+                if keys:
+                    logger.debug("Keeping %d key(s) typed before the grab", len(keys))
+                finish = self.switcher.start_switch(target)
+                ok = self.injector.replace_text(
+                    backspace_count + len(keys),
+                    text + self._keys_text(keys, target),
+                    target,
+                    before_typing=finish,
+                )
+            if first_grabbed:
+                self.injector.forward_events(first_grabbed)
+            replayed = first_grabbed + self._replay_while_grabbed(seen)
+        finally:
+            ungrabbed_at = time.time()
+            self._ungrab(grabbed)
+        # Events read after the ungrab but stamped before it were grabbed too:
+        # the application never saw them, so they are replayed as well.
+        after = self._take_late_keys()
+        missed = [event for event in after if _event_time(event) <= ungrabbed_at]
+        if missed:
+            self.injector.forward_events(missed)
+        if replayed or missed:
+            logger.debug("Replayed %d event(s) typed during the fix", len(replayed) + len(missed))
+        # Hand everything back to the loop, in the order it was typed. The
+        # early keys already reached the application and the replayed ones are
+        # on screen now, so all of them only update the next-word buffer.
+        self._event_queue.extend(early)
+        self._event_queue.extend(replayed)
+        self._event_queue.extend(after)
+        return ok
+
+    def _replay_while_grabbed(self, seen: list[object]) -> list[object]:
+        """Replay grabbed key events until every key is released.
+
+        ``seen`` holds the events collected (not yet handled) earlier in this
+        fix; together with ``_keys_down`` they give the current key state.
+        """
+        replayed: list[object] = []
+        deadline = time.monotonic() + GRAB_MAX_SECONDS
+        while True:
+            events = self._take_late_keys()
+            if events:
+                self.injector.forward_events(events)
+                replayed.extend(events)
+            if not self._keys_held(seen + replayed) or time.monotonic() > deadline:
+                return replayed
+            time.sleep(0.002)
+
+    def _wait_for_keys_up(self, seen: list[object], timeout: float) -> bool:
+        """Wait (bounded) until no key is held; return whether that happened.
+
+        Events read while waiting are appended to ``seen``, unhandled.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            seen.extend(self._take_late_keys())
+            if not self._keys_held(seen):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.002)
+
+    def _keys_held(self, pending: list[object]) -> bool:
+        """Return whether a key is down after the handled and ``pending`` events."""
+        down = set(self._keys_down)
+        for event in pending:
+            _track_key_state(down, event)
+        return bool(down)
+
+    @staticmethod
+    def _ungrab(devices: list[Any]) -> None:
+        for device in devices:
+            with contextlib.suppress(OSError):
+                device.ungrab()
+
+    def _physical_keyboards(self) -> list[Any]:
+        """Return the keyboards the loop reads (not the control socket)."""
+        if self._selector is None:
+            return []
+        return [
+            key.data
+            for key in self._selector.get_map().values()
+            if not isinstance(key.data, ControlServer)
+        ]
+
+    def _take_late_keys(self) -> list[object]:
+        """Return the events typed after the current word, without handling them.
+
+        That is everything already read but not yet handled, plus whatever the
+        kernel queued on the keyboards since the last read.
+        """
+        events = list(self._event_queue)
+        self._event_queue.clear()
+        for device in self._physical_keyboards():
+            read_one = getattr(device, "read_one", None)
+            if read_one is None:
+                continue
+            try:
+                while (event := read_one()) is not None:
+                    events.append(event)
+            except (BlockingIOError, OSError):
+                continue
+        return events
+
+    def _plain_keys(self, events: list[object]) -> list[tuple[int, bool]] | None:
+        """Reduce ``events`` to the ``(code, shift)`` of plain letter presses.
+
+        Returns ``None`` when anything else was pressed (or auto-repeated), in
+        which case a count-based rewrite would be unsafe.
+        """
+        try:
+            import evdev
+        except ImportError:  # pragma: no cover
+            return None
+        shift = self._shift
+        keys: list[tuple[int, bool]] = []
+        for event in events:
+            if getattr(event, "type", None) != evdev.ecodes.EV_KEY:
+                continue
+            code = int(getattr(event, "code", -1))
+            value = int(getattr(event, "value", 0))
+            name = self._code_to_name(code)
+            if name in _SHIFT_KEYS:
+                shift = value in (1, 2)
+                continue
+            if value == 0:
+                continue
+            if value == 2 or name == "KEY_SPACE" or name in _MODIFIER_FAMILIES:
+                return None
+            if code not in self._code_to_pair:
+                return None
+            keys.append((code, shift))
+        return keys
+
+    def _keys_text(self, keys: list[tuple[int, bool]], layout: str) -> str:
+        """Return what ``keys`` produce in ``layout``."""
+        layout_map = self.converter._forward.get(layout) or {}
+        chars = []
+        for code, shift in keys:
+            lower, upper = self._code_to_pair[code]
+            canonical = upper if shift else lower
+            chars.append(layout_map.get(canonical, canonical))
+        return "".join(chars)
 
     def _start_tray(self) -> None:
         """Start the optional tray icon when enabled in the configuration."""
@@ -2385,8 +2641,7 @@ class KlyrshiftDaemon:
                     continue
                 device = key.data
                 try:
-                    for event in device.read():
-                        self._handle_event(event)
+                    self._event_queue.extend(device.read())
                 except OSError as exc:
                     logger.warning("Device read error (device removed?): %s", exc)
                     with contextlib.suppress(KeyError, ValueError):
@@ -2394,6 +2649,8 @@ class KlyrshiftDaemon:
                         registered -= 1
                     with contextlib.suppress(OSError):
                         device.close()
+            while self._event_queue:
+                self._handle_event(self._event_queue.popleft())
 
             self._flush_if_idle()
             self._persist_learning_if_due()
