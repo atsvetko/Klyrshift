@@ -21,6 +21,7 @@ import logging
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from typing import Any, Final
 
 from .converter import LayoutConverter
@@ -239,7 +240,13 @@ class TextInjector:
             return False
         return self._char_to_key(char, layout) is not None
 
-    def replace_text(self, backspace_count: int, new: str, layout: str) -> bool:
+    def replace_text(
+        self,
+        backspace_count: int,
+        new: str,
+        layout: str,
+        before_typing: Callable[[], bool] | None = None,
+    ) -> bool:
         """Delete ``backspace_count`` characters and type ``new``.
 
         The caller passes a *count* rather than the old text: the daemon tracks
@@ -252,6 +259,12 @@ class TextInjector:
             backspace_count: How many Backspace presses to emit.
             new: The corrected text to type.
             layout: The layout that will be active while typing ``new``.
+            before_typing: Called after the deletion and before ``new`` is
+                typed. The daemon passes the second half of a layout switch
+                here (:meth:`LayoutSwitcher.start_switch`), so waiting for the
+                compositor to apply the new layout overlaps the deletion. A
+                ``False`` result is logged; the text is typed regardless,
+                exactly as when a synchronous switch fails.
 
         Returns:
             ``True`` when the replacement succeeded.
@@ -265,14 +278,21 @@ class TextInjector:
         # crash window in which the daemon had deleted the old text but not yet
         # typed the replacement, which would leave the user with truncated text.
         if self._backend == BACKEND_UINPUT:
-            return self._uinput_batch(backspace_count, new, layout)
+            return self._uinput_batch(backspace_count, new, layout, before_typing)
 
         if not self._send_backspaces(backspace_count):
             logger.warning("Failed to send backspaces; aborting replacement")
             return False
 
         time.sleep(SETTLE_DELAY)
+        self._run_before_typing(before_typing)
         return self._type_text(new, layout)
+
+    @staticmethod
+    def _run_before_typing(before_typing: Callable[[], bool] | None) -> None:
+        """Run the pre-typing hook, logging (not failing) a ``False`` result."""
+        if before_typing is not None and not before_typing():
+            logger.warning("Layout switch did not complete before typing")
 
     def _send_backspaces(self, count: int) -> bool:
         """Send ``count`` backspace presses."""
@@ -349,15 +369,17 @@ class TextInjector:
             return False
         return True
 
-    def tap_combo(self, key_names: list[str]) -> bool:
+    def tap_combo(self, key_names: list[str], taps: int = 1) -> bool:
         """Press ``key_names`` together (in order) through a virtual keyboard.
 
         Used for shortcuts such as ``Ctrl+C``. ``key_names`` are evdev names
         (``"KEY_LEFTCTRL"``, ``"KEY_C"``); modifiers are held while the last key
-        is tapped. Only the ``uinput`` backend is supported; other backends
-        return ``False``.
+        is tapped ``taps`` times (GNOME's input-source switcher, for example,
+        selects the *k*-th layout when Space is tapped *k* times under Super).
+        Only the ``uinput`` backend is supported; other backends return
+        ``False``.
         """
-        if not key_names or self._backend != BACKEND_UINPUT:
+        if not key_names or taps < 1 or self._backend != BACKEND_UINPUT:
             return False
         try:
             import evdev
@@ -377,8 +399,9 @@ class TextInjector:
             device = self._acquire_uinput(evdev, code_set)
             for code in resolved[:-1]:
                 device.write(ev_key, code, 1)
-            device.write(ev_key, resolved[-1], 1)
-            device.write(ev_key, resolved[-1], 0)
+            for _ in range(taps):
+                device.write(ev_key, resolved[-1], 1)
+                device.write(ev_key, resolved[-1], 0)
             for code in reversed(resolved[:-1]):
                 device.write(ev_key, code, 0)
             device.syn()
@@ -501,7 +524,13 @@ class TextInjector:
             return False
         return True
 
-    def _uinput_batch(self, backspace_count: int, text: str, layout: str) -> bool:
+    def _uinput_batch(
+        self,
+        backspace_count: int,
+        text: str,
+        layout: str,
+        before_typing: Callable[[], bool] | None = None,
+    ) -> bool:
         """Delete ``backspace_count`` chars and type ``text``.
 
         The backspaces are written and flushed with a single ``syn`` so a crash
@@ -540,6 +569,7 @@ class TextInjector:
 
         if self._settle_ms > 0:
             time.sleep(self._settle_ms / 1000.0)
+        self._run_before_typing(before_typing)
 
         try:
             device = self._acquire_uinput(evdev, codes)

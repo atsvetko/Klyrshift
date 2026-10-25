@@ -467,3 +467,87 @@ def test_uinput_batch_no_syn_means_nothing_applied(
 
     injector = TextInjector(backend="uinput")
     assert injector.replace_text(6, "привет", "ru") is False
+
+
+def test_tap_combo_taps_the_last_key_under_held_modifiers(
+    monkeypatch: pytest.MonkeyPatch, fake_uinput: type[_FakeUInputDevice]
+) -> None:
+    """Super held, Space tapped twice: GNOME selects the second-most-recent layout."""
+    created: list[_FakeUInputDevice] = []
+
+    class RecordingUInput(_FakeUInputDevice):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(TextInjector, "_uinput_available", lambda self: True)
+    monkeypatch.setattr(sys.modules["evdev"], "UInput", RecordingUInput)
+    ecodes = sys.modules["evdev"].ecodes
+    meta, space = ecodes.KEY_LEFTMETA, ecodes.KEY_SPACE
+
+    injector = TextInjector(backend="uinput")
+    assert injector.tap_combo(["KEY_LEFTMETA", "KEY_SPACE"], taps=2) is True
+    assert created[-1].events == [
+        (1, meta, 1),
+        (1, space, 1),
+        (1, space, 0),
+        (1, space, 1),
+        (1, space, 0),
+        (1, meta, 0),
+    ]
+    assert injector.tap_combo(["KEY_LEFTMETA", "KEY_SPACE"], taps=0) is False
+
+
+def test_before_typing_runs_between_deletion_and_text(
+    monkeypatch: pytest.MonkeyPatch, fake_uinput: type[_FakeUInputDevice]
+) -> None:
+    """The layout-switch wait sits after the Backspaces and before the text."""
+    created: list[_FakeUInputDevice] = []
+    seen: list[int] = []
+
+    class RecordingUInput(_FakeUInputDevice):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(TextInjector, "_uinput_available", lambda self: True)
+    monkeypatch.setattr(sys.modules["evdev"], "UInput", RecordingUInput)
+
+    def before_typing() -> bool:
+        seen.append(len(created[0].events))
+        return True
+
+    injector = TextInjector(backend="uinput")
+    assert injector.replace_text(3, "gh", "us", before_typing=before_typing) is True
+    # Six Backspace events were written before the hook ran, the text after it.
+    assert seen == [6]
+    assert len(created[0].events) > 6
+
+
+def test_before_typing_failure_still_types(
+    monkeypatch: pytest.MonkeyPatch, fake_uinput: type[_FakeUInputDevice]
+) -> None:
+    monkeypatch.setattr(TextInjector, "_uinput_available", lambda self: True)
+    injector = TextInjector(backend="uinput")
+    assert injector.replace_text(1, "a", "us", before_typing=lambda: False) is True
+
+
+def test_before_typing_runs_for_command_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(TextInjector, "_uinput_available", lambda self: False)
+    monkeypatch.setattr(injector_module, "_which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(injector_module.time, "sleep", lambda seconds: None)
+
+    def run(command: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+        order.append("key" if "key" in command else "type")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(injector_module, "_run", run)
+    injector = TextInjector(backend="xdotool")
+
+    def before_typing() -> bool:
+        order.append("switch")
+        return True
+
+    assert injector.replace_text(2, "hi", "us", before_typing=before_typing) is True
+    assert order == ["key", "key", "switch", "type"]
