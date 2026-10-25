@@ -302,7 +302,9 @@ word is scored against the corpora whose *layout could have produced it*.
 - **Skip rules** (`ignore_all_caps`, `ignore_with_digits`, `ignore_emails_urls`,
   `custom_skip_regex`). These short-circuit a buffer before detection. Digital
   tokens, `ALL CAPS` and e-mail/URL/path-like tokens (an internal separator such
-  as `. @ / \ : _ -`) are left untouched.
+  as `. @ / \ : _ -`) are left untouched. A "separator" that is a letter key of
+  the target layout is not one: `ю` is typed on `.`, so `люди` on US reads
+  `k.lb`, and the layout fix still applies (`LanguageDetector.separators_are_letters`).
 - **False-positive guards** (`plausibility_check`, `structural_boundaries`,
   `identifier_guard`, all on by default). Three layers keep the detector from
   rewriting text that already reads as real words:
@@ -315,6 +317,19 @@ word is scored against the corpora whose *layout could have produced it*.
     tokens are treated as identifiers, not prose.
   The guards run **after** the user-dictionary check, so a taught word
   (`муксуд` → `vercel`) is still fixed even when the source looks plausible.
+- **Keystroke likelihood** (`KeystrokeModel` in `detector.py`). The plausibility
+  score averages bigram frequencies per word, which dilutes a single impossible
+  letter pair and puts the two languages on different scales. The detector also
+  scores the *same keystrokes* under both hypotheses with a conditional bigram
+  model recovered from the shipped counts, so the two log-likelihoods compare
+  directly. The margin is used three ways: a conversion the score path rejected
+  is applied when the converted text is clearly more likely (`LIKELIHOOD_ACCEPT`),
+  one it accepted is dropped when the converted text is not more likely
+  (`LIKELIHOOD_VETO`), and a token whose structural markers are letters of the
+  other layout needs known words or a large margin (`SEPARATOR_LETTER_ACCEPT`).
+  A buffer shorter than four characters is only converted into a known word.
+  A likelihood-only fix reports the automatic threshold as its confidence, so
+  hybrid mode keeps withholding it. `scripts/bench_detector.py` measures it.
 - **User dictionary** (`dictionary_size`, `dictionary_custom_path`). A
   newline-separated list of words the user taught the daemon. It is a deliberate,
   explicit file (`~/.local/share/klyrshift/dictionary.txt` by default) — the

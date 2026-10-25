@@ -2002,10 +2002,19 @@ class KlyrshiftDaemon:
             self._note_kept(buffer)
             return
 
-        if self.config.ignore_emails_urls and _INTERNAL_SEPARATOR_RE.search(buffer):
+        if (
+            self.config.ignore_emails_urls
+            and _INTERNAL_SEPARATOR_RE.search(buffer)
+            and not (
+                reason == "layout" and self.detector.separators_are_letters(buffer, current, target)
+            )
+        ):
             # A URL, e-mail, path, file name or hyphenated identifier. Rewriting
             # it would corrupt a token that is intentionally not a word, even
-            # when the detector finds the other layout more plausible.
+            # when the detector finds the other layout more plausible. A layout
+            # fix whose "separators" are letters of the target layout (``.`` is
+            # ``ю``: ``k.lb`` is ``люди``) is not such a token; the detector
+            # already required strong evidence before choosing it.
             logger.debug("Buffer contains an internal separator; skipping")
             return
 

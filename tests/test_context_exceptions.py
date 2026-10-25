@@ -208,6 +208,26 @@ def test_email_url_skipped_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None
     assert _injector(daemon).replacements == []
 
 
+def test_dot_that_is_a_russian_letter_is_not_a_separator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``люди`` typed on US reads ``k.lb``: the dot is the ``ю`` key, not a
+    # file-name separator, so the URL/e-mail guard must not swallow the fix.
+    daemon = make_daemon(monkeypatch, ignore_emails_urls=True)
+    daemon.buffer = "k.lb"
+    daemon._scancodes = [1, 2, 3, 4]
+    tap(daemon, "KEY_SPACE")
+    assert [(new, layout) for _, new, layout in _injector(daemon).replacements] == [("люди ", "ru")]
+
+
+def test_dotted_file_name_still_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    daemon = make_daemon(monkeypatch, ignore_emails_urls=True)
+    daemon.buffer = "file.txt"
+    daemon._scancodes = [1, 2, 3, 4, 5, 6, 7, 8]
+    tap(daemon, "KEY_SPACE")
+    assert _injector(daemon).replacements == []
+
+
 def test_custom_skip_regex(monkeypatch: pytest.MonkeyPatch) -> None:
     daemon = make_daemon(monkeypatch, custom_skip_regex=r"^ghb")
     press(daemon, "ghbdtn")

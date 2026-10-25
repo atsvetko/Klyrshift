@@ -2555,7 +2555,9 @@ word is scored against the corpora whose *layout could have produced it*.
 - **Skip rules** (`ignore_all_caps`, `ignore_with_digits`, `ignore_emails_urls`,
   `custom_skip_regex`). These short-circuit a buffer before detection. Digital
   tokens, `ALL CAPS` and e-mail/URL/path-like tokens (an internal separator such
-  as `. @ / \ : _ -`) are left untouched.
+  as `. @ / \ : _ -`) are left untouched. A "separator" that is a letter key of
+  the target layout is not one: `ю` is typed on `.`, so `люди` on US reads
+  `k.lb`, and the layout fix still applies (`LanguageDetector.separators_are_letters`).
 - **False-positive guards** (`plausibility_check`, `structural_boundaries`,
   `identifier_guard`, all on by default). Three layers keep the detector from
   rewriting text that already reads as real words:
@@ -2568,6 +2570,19 @@ word is scored against the corpora whose *layout could have produced it*.
     tokens are treated as identifiers, not prose.
   The guards run **after** the user-dictionary check, so a taught word
   (`муксуд` → `vercel`) is still fixed even when the source looks plausible.
+- **Keystroke likelihood** (`KeystrokeModel` in `detector.py`). The plausibility
+  score averages bigram frequencies per word, which dilutes a single impossible
+  letter pair and puts the two languages on different scales. The detector also
+  scores the *same keystrokes* under both hypotheses with a conditional bigram
+  model recovered from the shipped counts, so the two log-likelihoods compare
+  directly. The margin is used three ways: a conversion the score path rejected
+  is applied when the converted text is clearly more likely (`LIKELIHOOD_ACCEPT`),
+  one it accepted is dropped when the converted text is not more likely
+  (`LIKELIHOOD_VETO`), and a token whose structural markers are letters of the
+  other layout needs known words or a large margin (`SEPARATOR_LETTER_ACCEPT`).
+  A buffer shorter than four characters is only converted into a known word.
+  A likelihood-only fix reports the automatic threshold as its confidence, so
+  hybrid mode keeps withholding it. `scripts/bench_detector.py` measures it.
 - **User dictionary** (`dictionary_size`, `dictionary_custom_path`). A
   newline-separated list of words the user taught the daemon. It is a deliberate,
   explicit file (`~/.local/share/klyrshift/dictionary.txt` by default) — the
@@ -3257,6 +3272,7 @@ regression thresholds.
 | Lint / types | `ruff`, `isort`, `black --check`, `mypy --strict` | Yes | Style, imports, type soundness |
 | Unit / integration | `pytest`, coverage floor 80 % | Yes | Logic, parsing, config, conversion, daemon policy |
 | Detector quality | `scripts/measure_detector.py` | Manually | Recall, false positives, corruption, speed on fixed corpora |
+| Detector quality (held out) | `scripts/bench_detector.py` | Manually | Hit rate and false corrections on words the detector never loads |
 | Detector cost | `scripts/measure_latency.py` | In CI (`latency-budget`) | ms/word and peak memory on fixed corpora, with a budget |
 | Package smoke | `scripts/smoke_test.sh` | Yes | The built `.deb` installs and its entry points run |
 | Manual desktop | `docs/TESTING.md` level 3 | No | Permissions, D-Bus, `uinput`, real applications |
@@ -3282,6 +3298,32 @@ comparable**; a top-1000 run and a top-3000 run are different measurements.
 PYTHONPATH=src python scripts/measure_detector.py --limit 1000
 PYTHONPATH=src python scripts/measure_detector.py --limit 3000
 ```
+
+#### Held-out benchmark
+
+`measure_detector.py` slices the corpora the detector loads, so a word it
+misses there is one it has *seen*. `scripts/bench_detector.py` scores a
+hand-written set (`scripts/bench_detector_words.tsv`) instead: Russian and
+English words (common, inflected, 2-4 letters, names, case variants) typed both
+correctly and on the wrong layout, plus code, URLs and file names,
+transliteration, abbreviations and ru/en look-alikes that must never change. It
+builds the detector from `Config()` defaults, applies the daemon's separator
+guard, and splits the words into a fixed `dev`/`test` half: tune on `dev`,
+confirm on `test`.
+
+```bash
+PYTHONPATH=src python scripts/bench_detector.py            # default 10k vocabulary
+PYTHONPATH=src python scripts/bench_detector.py --extended # + bundled 50k lists
+PYTHONPATH=src python scripts/bench_detector.py --misses   # list every miss
+```
+
+| Tree | Hit (540 wrong-layout words) | False corrections (742 correct tokens) |
+|---|---|---|
+| before the keystroke likelihood | 475 (88.0 %) | 9 (1.2 %) |
+| with the keystroke likelihood | 488 (90.4 %) | 0 (0.0 %) |
+
+Two-letter words (39 of the 540) are below `min_word_length` and never fixed
+automatically, so 92.8 % is the ceiling at the default setting.
 
 #### Recorded baseline
 
@@ -3768,6 +3810,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### [Unreleased]
 
 #### Added
+
+- **A held-out detector benchmark.** `scripts/bench_detector.py` scores a
+  hand-written word set the detector never loads (ordinary and inflected words,
+  short words, names, case variants, plus code, URLs, transliteration and
+  abbreviations that must stay as typed) and reports the hit rate and false
+  corrections by category, word length and vocabulary membership.
+
+- **A keystroke-likelihood check in the detector.** The same keys are scored as
+  "typed on purpose" and as "meant for the other layout" with a conditional
+  bigram model recovered from the shipped counts. On the held-out benchmark
+  wrong-layout fixes rise from 88.0 % to 90.4 % and false corrections fall from
+  1.2 % to 0: `cfg`, `pdf`, `vpn`, `имхо`, `спб` are no longer rewritten, while
+  `strengths`, `Netflix`, `Пушкин` and many untaught brands (`муксуд` →
+  `vercel`) are now fixed.
+
+#### Fixed
+
+- **Russian words with `ю`, `х` or `ъ` typed on the US layout are fixed.** Those
+  letters sit on `.`, `[` and `]`, so `люди` typed on US (`k.lb`) or `компьютер`
+  (`rjvgm.nth`) looked like a file name and the URL guard skipped them. A
+  separator that is a letter key of the target layout no longer counts, provided
+  the conversion gives known words or is far more likely; `file.txt`,
+  `github.com` and `arr[i]` stay untouched.
 
 - **A comparison section on the landing page.** The README carried a feature
   matrix against the other Linux layout switchers, but the page a visitor lands

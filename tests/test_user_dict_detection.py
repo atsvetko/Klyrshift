@@ -25,9 +25,14 @@ def test_brand_is_rewritten_when_taught() -> None:
 
 
 def test_brand_is_not_rewritten_when_unknown() -> None:
+    # ``kafka`` typed on ru reads ``лфалф``, which the keystroke model cannot
+    # tell from a Russian word on its own. (``муксуд`` used to be the example;
+    # the likelihood test now resolves it untaught.)
     detector = make_detector([])
-    assert detector.target_layout("муксуд", "ru") is None
-    assert detector.should_fix("муксуд", "ru") is False
+    assert detector.target_layout("лфалф", "ru") is None
+    assert detector.should_fix("лфалф", "ru") is False
+    taught = make_detector(["kafka"])
+    assert taught.target_layout("лфалф", "ru") == "us"
 
 
 def test_taught_typed_word_is_never_rewritten() -> None:
@@ -39,9 +44,9 @@ def test_taught_typed_word_is_never_rewritten() -> None:
 
 
 def test_taught_word_only_matches_its_own_conversion() -> None:
-    # Teaching a *different* brand must not turn "муксуд" into a correction.
+    # Teaching a *different* brand must not turn "лфалф" into a correction.
     detector = make_detector(["невектор"])
-    assert detector.target_layout("муксуд", "ru") is None
+    assert detector.target_layout("лфалф", "ru") is None
 
 
 def test_user_word_property_is_sorted_and_lowercased() -> None:

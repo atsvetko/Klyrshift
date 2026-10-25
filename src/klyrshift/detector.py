@@ -118,6 +118,32 @@ UNKNOWN_BIGRAM_PROBABILITY: Final[float] = 1e-7
 # Minimum plausibility gain required before a conversion is applied.
 MIN_IMPROVEMENT: Final[float] = 1.0
 
+# --- Keystroke likelihood --------------------------------------------------
+# ``_plausibility`` averages *joint* bigram frequencies per word. The average
+# dilutes a single impossible letter pair (``^ы`` in ``ыекутперы``, which is
+# ``strengths`` typed on the Russian layout), and the two languages' averages sit
+# on different scales, so they compare poorly with each other. The likelihood
+# test scores the *same keystrokes* under both hypotheses ("typed on purpose in
+# the current layout" against "meant for the other layout") with a conditional
+# bigram model P(letter | previous letter) recovered from the shipped counts.
+# Both scores are log-likelihoods of one key sequence, so their difference is
+# directly comparable. ``scripts/bench_detector.py`` measures the effect.
+#
+# Add-k smoothing for letter pairs the corpus never saw.
+LIKELIHOOD_SMOOTHING: Final[float] = 0.5
+# Log-probability charged for a non-letter character inside a token.
+NON_LETTER_LOG_PROBABILITY: Final[float] = math.log(1e-3)
+# A conversion the score path rejected is still applied when the converted text
+# is at least this much (natural log) more likely than the text as typed.
+LIKELIHOOD_ACCEPT: Final[float] = 4.0
+# A conversion the score path accepted is dropped when the converted text is not
+# more likely than the text as typed (``cfg`` -> ``сап``, ``имхо`` -> ``bv[j``).
+LIKELIHOOD_VETO: Final[float] = 0.0
+# A token whose "separators" are letter keys of the target layout (``k.lb`` is
+# ``люди``) is only converted on stronger evidence, because a real URL or file
+# name looks the same.
+SEPARATOR_LETTER_ACCEPT: Final[float] = 8.0
+
 # --- Calibrated confidence -------------------------------------------------
 # The raw ``improvement`` margin above is unbounded and its scale depends on the
 # word count, so it is a poor input for a *threshold* the user has to reason
@@ -177,6 +203,76 @@ class Confidence:
         }
         reason = reasons.get(self.evidence, self.evidence)
         return _("уверенность {0}% ({1})").format(percent, reason)
+
+
+@dataclass(frozen=True)
+class KeystrokeModel:
+    """Conditional bigram model ``P(letter | previous letter)`` of one language.
+
+    Built from the joint bigram frequencies in ``ngrams_<lang>.json``. Those are
+    ``count / total`` over the corpus' letter pairs, and the rarest pair was seen
+    exactly once, so ``frequency / min(frequency)`` gives the counts back without
+    a data change. ``^`` and ``$`` mark the start and end of a word.
+    """
+
+    counts: dict[str, int]
+    outgoing: dict[str, int]
+    alphabet: frozenset[str]
+
+    @classmethod
+    def from_frequencies(cls, bigrams: dict[str, float]) -> KeystrokeModel | None:
+        """Return the model for ``bigrams``, or ``None`` when there is none."""
+        frequencies = {pair: freq for pair, freq in bigrams.items() if len(pair) == 2 and freq > 0}
+        if not frequencies:
+            return None
+        smallest = min(frequencies.values())
+        counts = {pair: max(1, round(freq / smallest)) for pair, freq in frequencies.items()}
+        # The frequency lists carry a few loanwords in the other script (``the``
+        # in the Russian list). Keep the corpus' own script only, so a stray
+        # Latin pair does not widen the Russian alphabet.
+        script = {"cyrillic": 0, "latin": 0}
+        for pair, count in counts.items():
+            for char in pair:
+                if char not in "^$" and _alphabet_of(char) != "other":
+                    script[_alphabet_of(char)] += count
+        foreign = "latin" if script["cyrillic"] >= script["latin"] else "cyrillic"
+        counts = {
+            pair: count
+            for pair, count in counts.items()
+            if not any(_alphabet_of(char) == foreign for char in pair)
+        }
+        outgoing: dict[str, int] = {}
+        for pair, count in counts.items():
+            outgoing[pair[0]] = outgoing.get(pair[0], 0) + count
+        alphabet = frozenset(char for pair in counts for char in pair if char not in "^$")
+        return cls(counts=counts, outgoing=outgoing, alphabet=alphabet)
+
+    def _log_probability(self, previous: str, char: str) -> float:
+        # Every letter of the alphabet plus the end marker may follow a letter.
+        size = len(self.alphabet) + 1
+        count = self.counts.get(previous + char, 0) + LIKELIHOOD_SMOOTHING
+        return math.log(count / (self.outgoing.get(previous, 0) + LIKELIHOOD_SMOOTHING * size))
+
+    def log_likelihood(self, text: str) -> float:
+        """Return the natural-log likelihood of typing ``text`` in this language.
+
+        A character outside the alphabet (punctuation, a digit, a letter of the
+        other script) ends the current word and costs
+        :data:`NON_LETTER_LOG_PROBABILITY`; whitespace only ends the word.
+        """
+        total = 0.0
+        previous = "^"
+        for char in text.lower() + " ":
+            if char in self.alphabet:
+                total += self._log_probability(previous, char)
+                previous = char
+                continue
+            if previous != "^":
+                total += self._log_probability(previous, "$")
+            if not char.isspace():
+                total += NON_LETTER_LOG_PROBABILITY
+            previous = "^"
+        return total
 
 
 def _has_cyrillic(text: str) -> bool:
@@ -268,10 +364,12 @@ class LanguageDetector:
         self._vocabularies: dict[str, set[str]] = {}
         self._vocabulary_order: dict[str, list[str]] = {}
         self._bigrams: dict[str, dict[str, float]] = {}
+        self._keystroke_models: dict[str, KeystrokeModel] = {}
         self._load_corpora()
 
     def _load_corpora(self) -> None:
         """Load bigram frequencies and vocabularies for every known language."""
+        self._keystroke_models = {}
         candidates = (
             list(self._languages)
             if self._languages is not None
@@ -317,6 +415,9 @@ class LanguageDetector:
             self._vocabularies[language] = vocabulary
             self._vocabulary_order[language] = [str(w).lower() for w in raw_words]
             self._bigrams[language] = bigrams
+            model = KeystrokeModel.from_frequencies(bigrams)
+            if model is not None:
+                self._keystroke_models[language] = model
 
     @staticmethod
     def _read_corpus(language: str) -> dict[str, Any]:
@@ -914,6 +1015,109 @@ class LanguageDetector:
             return True
         return bool(self.plausibility_check and self._looks_like_real_words(text, current_layout))
 
+    def likelihood_margin(self, text: str, current_layout: str, layout: str) -> float | None:
+        """Return how much more likely ``text`` is as a ``layout`` mistake.
+
+        The value is ``log P(converted | target language) - log P(text | current
+        language)`` under each language's :class:`KeystrokeModel`: positive when
+        the keystrokes read better as the other layout. ``None`` when either
+        language has no bigram model.
+        """
+        current_language = self._layout_language(current_layout)
+        target_language = self._layout_language(layout)
+        if current_language is None or target_language is None:
+            return None
+        current_model = self._keystroke_models.get(current_language)
+        target_model = self._keystroke_models.get(target_language)
+        if current_model is None or target_model is None:
+            return None
+        converted = self.converter.convert(text, current_layout, layout)
+        return target_model.log_likelihood(converted) - current_model.log_likelihood(text)
+
+    def separators_are_letters(self, text: str, current_layout: str, layout: str) -> bool:
+        """Return ``True`` when every non-alphanumeric key of ``text`` is a letter in ``layout``.
+
+        Six Russian letters sit on punctuation keys of the US layout (``б`` on
+        ``,``, ``ю`` on ``.``, ``х``/``ъ`` on ``[``/``]``, ``ж``/``э`` on ``;``/``'``),
+        so ``люди`` typed on US reads ``k.lb`` and trips the URL/path guards. Those
+        characters are only separators in the layout they were typed in.
+        """
+        converted = self.converter.convert(text, current_layout, layout)
+        if len(converted) != len(text):
+            return False
+        return all(
+            target.isalpha()
+            for source, target in zip(text, converted, strict=True)
+            if not (source.isalnum() or source.isspace())
+        )
+
+    def _conversion_candidates(self, current_layout: str) -> list[str]:
+        """Return one layout per loaded language other than the current one."""
+        current_language = self._layout_language(current_layout)
+        candidates: list[str] = []
+        for language in sorted(self._vocabularies):
+            if language == current_language:
+                continue
+            layout = self._language_layout(language)
+            if layout is not None and layout != current_layout:
+                candidates.append(layout)
+        return candidates
+
+    def _separator_letter_target(
+        self, text: str, current_layout: str
+    ) -> tuple[str | None, float | None]:
+        """Return a target for a token whose structural markers are letters elsewhere.
+
+        Called only when the structural guard fired. The guard stays absolute
+        for real structure: an identifier (camelCase, ``_``, a digit) is never
+        lifted, and neither is a token whose markers stay separators after the
+        conversion. Otherwise the conversion must yield known words, or be far
+        more likely (:data:`SEPARATOR_LETTER_ACCEPT`) than the token as typed.
+        """
+        if self.identifier_guard and _IDENTIFIER_RE.search(text):
+            return None, None
+        validated = self._vocabulary_validated_layout(text, current_layout)
+        for layout in self._conversion_candidates(current_layout):
+            if not self.separators_are_letters(text, current_layout, layout):
+                continue
+            converted = self.converter.convert(text, current_layout, layout)
+            if self._should_guard_structure_only(converted):
+                continue
+            if validated == layout:
+                return layout, float("inf")
+            if len(text) < SHORT_BUFFER_LENGTH:
+                continue
+            margin = self.likelihood_margin(text, current_layout, layout)
+            if margin is not None and margin >= SEPARATOR_LETTER_ACCEPT:
+                return layout, MIN_IMPROVEMENT + self.confidence_threshold
+        return None, None
+
+    def _likelihood_target(self, text: str, current_layout: str) -> str | None:
+        """Return a layout the keystroke likelihood alone justifies, or ``None``.
+
+        The fallback for a buffer the plausibility guard or the score threshold
+        rejected. It stays narrow: a short buffer is never converted on a model
+        score, a buffer containing a known word of the current language is left
+        alone, and the converted text must still contain a word long enough to
+        judge.
+        """
+        if len(text) < SHORT_BUFFER_LENGTH or (_has_cyrillic(text) and _has_latin(text)):
+            return None
+        current_language = self._layout_language(current_layout)
+        vocabulary = self._vocabularies.get(current_language or "", set())
+        if any(word.lower() in vocabulary for word in WORD_RE.findall(text)):
+            return None
+        best_layout: str | None = None
+        best_margin = LIKELIHOOD_ACCEPT
+        for layout in self._conversion_candidates(current_layout):
+            converted = self.converter.convert(text, current_layout, layout)
+            if not any(len(w) >= self.min_word_length for w in WORD_RE.findall(converted)):
+                continue
+            margin = self.likelihood_margin(text, current_layout, layout)
+            if margin is not None and margin >= best_margin:
+                best_layout, best_margin = layout, margin
+        return best_layout
+
     def target_layout(
         self, buffer: str, current_layout: str, neighbor: str | None = None
     ) -> str | None:
@@ -992,7 +1196,18 @@ class LanguageDetector:
 
         # The structural and identifier guards are absolute: a URL, path or
         # code token is never rewritten, whatever a conversion would produce.
+        # The one exception is a "separator" that is a letter key of the other
+        # layout (``k.lb`` is ``люди``), which needs strong evidence instead.
         if self._should_guard_structure_only(stripped):
+            lifted, lifted_confidence = self._separator_letter_target(stripped, current_layout)
+            if lifted is not None:
+                logger.debug(
+                    "detect(len=%d): separators are letters in %s; target %s",
+                    len(stripped),
+                    lifted,
+                    lifted,
+                )
+                return lifted, lifted_confidence
             logger.debug("detect(len=%d): structural guard vetoed; skipping", len(stripped))
             return None, None
 
@@ -1010,10 +1225,11 @@ class LanguageDetector:
             )
             return validated, float("inf")
 
-        # The plausibility guard only ever prevents a conversion.
+        # The plausibility guard only ever prevents a conversion, unless the
+        # keystroke likelihood is decisive (see :meth:`_likelihood_target`).
         if self.plausibility_check and self._looks_like_real_words(stripped, current_layout):
-            logger.debug("detect(len=%d): plausibility guard vetoed; skipping", len(stripped))
-            return None, None
+            logger.debug("detect(len=%d): plausibility guard vetoed", len(stripped))
+            return self._likelihood_fallback(stripped, current_layout)
 
         words = [w for w in WORD_RE.findall(stripped) if len(w) >= self.min_word_length]
         if not words:
@@ -1040,6 +1256,7 @@ class LanguageDetector:
         best_layout: str | None = None
         best_score = current_score
         best_language = current_language
+        best_with_context = False
         for layout in self.converter.available_layouts:
             if layout == current_layout:
                 continue
@@ -1049,16 +1266,22 @@ class LanguageDetector:
                 # Without a corpus the candidate scores 0.0 for everything and
                 # would win purely because the current text scores negative.
                 continue
+            if not any(len(w) >= self.min_word_length for w in WORD_RE.findall(converted)):
+                # The conversion broke the word into fragments too short to
+                # score (``имхо`` -> ``bv[j``). Scoring nothing yields 0.0,
+                # which would beat any real word; it is not evidence.
+                continue
             # A candidate in the same alphabet family (for example ``ru`` ->
             # ``uk``, or ``de`` -> ``en``) is allowed: the physical positions are
             # identical for Latin layouts, so a German word typed on US can be
             # recognised as English. The language model still has to win.
             score = self._plausibility(converted, language)
-            if (
+            with_context = (
                 neighbor_language is not None
                 and self.context_weight > 0.0
                 and language == neighbor_language
-            ):
+            )
+            if with_context:
                 # A neighbouring word is weak evidence, so it only ever *adds*
                 # to a candidate; it can never push the current layout below
                 # zero or override the absolute improvement check below.
@@ -1067,6 +1290,7 @@ class LanguageDetector:
                 best_score = score
                 best_layout = layout
                 best_language = language
+                best_with_context = with_context
 
         if best_layout is None:
             logger.debug(
@@ -1075,7 +1299,7 @@ class LanguageDetector:
                 current_layout,
                 current_score,
             )
-            return None, None
+            return self._likelihood_fallback(stripped, current_layout)
         improvement = best_score - current_score
         # ``confidence_threshold`` raises the bar above the absolute minimum so
         # the user can make detection more conservative. It is deliberately
@@ -1090,7 +1314,7 @@ class LanguageDetector:
                 best_score,
                 improvement,
             )
-            return None, None
+            return self._likelihood_fallback(stripped, current_layout)
         # Guard against a same-alphabet target that merely re-labels the text
         # without changing it (``de`` -> ``en`` leaves letters untouched).
         if (
@@ -1099,6 +1323,18 @@ class LanguageDetector:
         ):
             logger.debug("detect(len=%d): same-alphabet no-op; skipping", len(stripped))
             return None, None
+        # A score is a guess, and a guess on a very short buffer is noise: only
+        # a vocabulary-validated conversion (handled above) fixes one. A verdict
+        # the neighbouring word helped reach is exempt: the context is the
+        # extra evidence a borderline word needs (see ``context_weight``).
+        if not best_with_context:
+            if len(stripped) < SHORT_BUFFER_LENGTH:
+                logger.debug("detect(len=%d): too short for a model verdict", len(stripped))
+                return None, None
+            margin = self.likelihood_margin(stripped, current_layout, best_layout)
+            if margin is not None and margin < LIKELIHOOD_VETO:
+                logger.debug("detect(len=%d): keystroke likelihood vetoed", len(stripped))
+                return None, None
         logger.debug(
             "detect(len=%d): current=%s score=%.3f best=%s score=%.3f; target %s",
             len(stripped),
@@ -1109,6 +1345,22 @@ class LanguageDetector:
             best_layout,
         )
         return best_layout, improvement
+
+    def _likelihood_fallback(
+        self, text: str, current_layout: str
+    ) -> tuple[str | None, float | None]:
+        """Return the likelihood-only verdict for a buffer the score path rejected.
+
+        The confidence reported is the automatic threshold itself: the
+        conversion clears the bar, but it is not a confident one, so hybrid
+        mode keeps withholding it for the manual hotkey.
+        """
+        layout = self._likelihood_target(text, current_layout)
+        if layout is None:
+            logger.debug("detect(len=%d): no conversion is likely enough", len(text))
+            return None, None
+        logger.debug("detect(len=%d): keystroke likelihood; target %s", len(text), layout)
+        return layout, MIN_IMPROVEMENT + self.confidence_threshold
 
     def should_fix(self, buffer: str, current_layout: str | None = None) -> bool:
         """Decide whether ``buffer`` should be corrected.
@@ -1129,8 +1381,12 @@ class LanguageDetector:
         if not stripped or self.is_stop_word(stripped):
             return False
 
-        # Structural/identifier tokens are never corrected, in any mode.
-        if self._should_guard_structure_only(stripped):
+        # Structural/identifier tokens are never corrected, in any mode, unless
+        # their separators are letters of the other layout (``k.lb``).
+        if self._should_guard_structure_only(stripped) and (
+            current_layout is None
+            or self._separator_letter_target(stripped, current_layout)[0] is None
+        ):
             return False
 
         # A buffer whose scripts occupy separate words is always wrong as a

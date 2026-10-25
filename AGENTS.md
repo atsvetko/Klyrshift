@@ -156,6 +156,21 @@ SMOKE_IMAGE=ubuntu:22.04 make smoke-test    # Python 3.10 path (tomli)
   separator between the two scripts flushes each half on its own boundary.
   Scripts in *separate* words (`привет hello`) are still converted as a whole —
   `tests/test_mixed_script_word.py` pins both directions.
+- **The keystroke likelihood only narrows or widens the score path; it never
+  replaces a guard.** `LanguageDetector.likelihood_margin` compares the same keys
+  under both languages' `KeystrokeModel`. A likelihood-only fix returns the
+  automatic threshold as its confidence, so hybrid mode still withholds it, and a
+  buffer shorter than `SHORT_BUFFER_LENGTH` is converted only into a known word
+  (unless the neighbouring word's context tipped it). Judge any change to the
+  constants with `scripts/bench_detector.py` on the `dev` split, then confirm on
+  `test`; do not tune on the lists the detector loads.
+- **A separator that is a letter key of the target layout is not a separator.**
+  `ю`, `х`, `ъ`, `б`, `ж`, `э` sit on `. [ ] , ; '` of the US layout, so `k.lb`
+  is `люди`. Both the detector's structural guard and the daemon's
+  `ignore_emails_urls` check consult `separators_are_letters`; the detector then
+  demands known words or `SEPARATOR_LETTER_ACCEPT`, which is what keeps
+  `file.txt` and `github.com` untouched. Identifiers (`_`, digits, camelCase)
+  are never lifted.
 - A double-tap modifier hotkey fires only when no *other* modifier family is
   held, so `Ctrl+Shift+Shift` is treated as a chord, not a fix.
 - Word-boundary triggers (`on_space`, `on_enter`, `on_tab`, `on_punctuation`)
@@ -175,8 +190,10 @@ SMOKE_IMAGE=ubuntu:22.04 make smoke-test    # Python 3.10 path (tomli)
   override: `target_layout` returns `None` for any taught word, in every layout.
   It also validates the *converted* form: if the wrong-layout rendering of the
   buffer is a taught word (``муксуд`` → ``vercel``), the correction fires even
-  though the brand is absent from the frequency corpora. This is why an unknown
-  brand is silent until `klyrshift dict add` teaches it. It is a vocabulary
+  though the brand is absent from the frequency corpora. The keystroke
+  likelihood test resolves many brands untaught (`муксуд` → `vercel`), but
+  one it cannot tell from a native word (`лфалф` → `kafka`) stays silent
+  until `klyrshift dict add` teaches it. It is a vocabulary
   membership test, not a score bonus — a bonus is drowned out by the n-gram
   penalties.
   The file (`~/.local/share/klyrshift/dictionary.txt` by default) is edited

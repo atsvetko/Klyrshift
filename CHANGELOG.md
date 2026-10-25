@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A held-out detector benchmark.** `scripts/bench_detector.py` scores a
+  hand-written word set the detector never loads (ordinary and inflected words,
+  short words, names, case variants, plus code, URLs, transliteration and
+  abbreviations that must stay as typed) and reports the hit rate and false
+  corrections by category, word length and vocabulary membership.
+
+- **A keystroke-likelihood check in the detector.** The same keys are scored as
+  "typed on purpose" and as "meant for the other layout" with a conditional
+  bigram model recovered from the shipped counts. On the held-out benchmark
+  wrong-layout fixes rise from 88.0 % to 90.4 % and false corrections fall from
+  1.2 % to 0: `cfg`, `pdf`, `vpn`, `имхо`, `спб` are no longer rewritten, while
+  `strengths`, `Netflix`, `Пушкин` and many untaught brands (`муксуд` →
+  `vercel`) are now fixed.
+
+### Fixed
+
+- **Russian words with `ю`, `х` or `ъ` typed on the US layout are fixed.** Those
+  letters sit on `.`, `[` and `]`, so `люди` typed on US (`k.lb`) or `компьютер`
+  (`rjvgm.nth`) looked like a file name and the URL guard skipped them. A
+  separator that is a letter key of the target layout no longer counts, provided
+  the conversion gives known words or is far more likely; `file.txt`,
+  `github.com` and `arr[i]` stay untouched.
+
 - **A comparison section on the landing page.** The README carried a feature
   matrix against the other Linux layout switchers, but the page a visitor lands
   on did not. `Comparison.astro` renders the same matrix (automatic correction,

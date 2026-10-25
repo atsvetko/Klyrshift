@@ -49,6 +49,7 @@ from klyrshift.detector import LanguageDetector  # noqa: E402
 WORDS_FILE = Path(__file__).resolve().parent / "bench_detector_words.tsv"
 OTHER_LAYOUT = {"ru": "us", "us": "ru"}
 LAYOUT_LANGUAGE = {"ru": "ru", "us": "en"}
+IGNORE_EMAILS_URLS = Config().ignore_emails_urls
 LENGTH_BUCKETS = ((2, 2, "2"), (3, 3, "3"), (4, 4, "4"), (5, 6, "5-6"), (7, 9, "7-9"))
 
 
@@ -112,7 +113,12 @@ def daemon_target(detector: LanguageDetector, text: str, layout: str) -> str | N
     target = detector.target_layout(text, layout)
     if target is None:
         return None
-    if Config().ignore_emails_urls and _INTERNAL_SEPARATOR_RE.search(text):
+    # Mirrors the separator check in ``KlyrshiftDaemon._process_buffer_inner``.
+    if (
+        IGNORE_EMAILS_URLS
+        and _INTERNAL_SEPARATOR_RE.search(text)
+        and not detector.separators_are_letters(text, layout, target)
+    ):
         return None
     return target
 

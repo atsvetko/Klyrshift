@@ -12,6 +12,7 @@ regression thresholds.
 | Lint / types | `ruff`, `isort`, `black --check`, `mypy --strict` | Yes | Style, imports, type soundness |
 | Unit / integration | `pytest`, coverage floor 80 % | Yes | Logic, parsing, config, conversion, daemon policy |
 | Detector quality | `scripts/measure_detector.py` | Manually | Recall, false positives, corruption, speed on fixed corpora |
+| Detector quality (held out) | `scripts/bench_detector.py` | Manually | Hit rate and false corrections on words the detector never loads |
 | Detector cost | `scripts/measure_latency.py` | In CI (`latency-budget`) | ms/word and peak memory on fixed corpora, with a budget |
 | Package smoke | `scripts/smoke_test.sh` | Yes | The built `.deb` installs and its entry points run |
 | Manual desktop | `docs/TESTING.md` level 3 | No | Permissions, D-Bus, `uinput`, real applications |
@@ -37,6 +38,32 @@ comparable**; a top-1000 run and a top-3000 run are different measurements.
 PYTHONPATH=src python scripts/measure_detector.py --limit 1000
 PYTHONPATH=src python scripts/measure_detector.py --limit 3000
 ```
+
+### Held-out benchmark
+
+`measure_detector.py` slices the corpora the detector loads, so a word it
+misses there is one it has *seen*. `scripts/bench_detector.py` scores a
+hand-written set (`scripts/bench_detector_words.tsv`) instead: Russian and
+English words (common, inflected, 2-4 letters, names, case variants) typed both
+correctly and on the wrong layout, plus code, URLs and file names,
+transliteration, abbreviations and ru/en look-alikes that must never change. It
+builds the detector from `Config()` defaults, applies the daemon's separator
+guard, and splits the words into a fixed `dev`/`test` half: tune on `dev`,
+confirm on `test`.
+
+```bash
+PYTHONPATH=src python scripts/bench_detector.py            # default 10k vocabulary
+PYTHONPATH=src python scripts/bench_detector.py --extended # + bundled 50k lists
+PYTHONPATH=src python scripts/bench_detector.py --misses   # list every miss
+```
+
+| Tree | Hit (540 wrong-layout words) | False corrections (742 correct tokens) |
+|---|---|---|
+| before the keystroke likelihood | 475 (88.0 %) | 9 (1.2 %) |
+| with the keystroke likelihood | 488 (90.4 %) | 0 (0.0 %) |
+
+Two-letter words (39 of the 540) are below `min_word_length` and never fixed
+automatically, so 92.8 % is the ceiling at the default setting.
 
 ### Recorded baseline
 
